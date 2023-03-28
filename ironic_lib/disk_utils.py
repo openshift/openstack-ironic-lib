@@ -80,6 +80,8 @@ _PARTED_PRINT_RE = re.compile(r"^(\d+):([\d\.]+)MiB:"
 CONFIGDRIVE_LABEL = "config-2"
 MAX_CONFIG_DRIVE_SIZE_MB = 64
 
+GPT_SIZE_SECTORS = 33
+
 # Maximum disk size supported by MBR is 2TB (2 * 1024 * 1024 MB)
 MAX_DISK_SIZE_MB_SUPPORTED_BY_MBR = 2097152
 
@@ -394,7 +396,8 @@ def qemu_img_info(path):
 
 def _retry_on_res_temp_unavailable(exc):
     if (isinstance(exc, processutils.ProcessExecutionError)
-            and 'Resource temporarily unavailable' in exc.stderr):
+            and ('Resource temporarily unavailable' in exc.stderr
+                 or 'Cannot allocate memory' in exc.stderr)):
         return True
     return False
 
@@ -411,7 +414,8 @@ def convert_image(source, dest, out_format, run_as_root=False):
                       prlimit=_qemu_img_limits(),
                       use_standard_locale=True)
     except processutils.ProcessExecutionError as e:
-        if 'Resource temporarily unavailable' in e.stderr:
+        if ('Resource temporarily unavailable' in e.stderr
+            or 'Cannot allocate memory' in e.stderr):
             LOG.debug('Failed to convert image, retrying. Error: %s', e)
             # Sync disk caches before the next attempt
             utils.execute('sync')
@@ -495,13 +499,24 @@ def destroy_disk_metadata(dev, node_uuid):
     # erasing partition data.
     # This is the same bug as
     # https://bugs.launchpad.net/ironic-python-agent/+bug/1737556
+
+    # Overwrite the Primary GPT, catch very small partitions (like EBRs)
     dd_device = 'of=%s' % dev
-    gpt_backup = get_dev_block_size(dev) - 33
-    dd_seek = 'seek=%i' % gpt_backup
-    utils.execute('dd', 'bs=512', 'if=/dev/zero', dd_device, 'count=33',
+    dd_count = 'count=%s' % GPT_SIZE_SECTORS
+    dev_size = get_dev_block_size(dev)
+    if dev_size < GPT_SIZE_SECTORS:
+        dd_count = 'count=%s' % dev_size
+    utils.execute('dd', 'bs=512', 'if=/dev/zero', dd_device, dd_count,
                   run_as_root=True, use_standard_locale=True)
-    utils.execute('dd', 'bs=512', 'if=/dev/zero', dd_device, 'count=33',
-                  dd_seek, run_as_root=True, use_standard_locale=True)
+
+    # Overwrite the Secondary GPT, do this only if there could be one
+    if dev_size > GPT_SIZE_SECTORS:
+        gpt_backup = dev_size - GPT_SIZE_SECTORS
+        dd_seek = 'seek=%i' % gpt_backup
+        dd_count = 'count=%s' % GPT_SIZE_SECTORS
+        utils.execute('dd', 'bs=512', 'if=/dev/zero', dd_device, dd_count,
+                      dd_seek, run_as_root=True, use_standard_locale=True)
+
     # Go ahead and let sgdisk run as well.
     utils.execute('sgdisk', '-Z', dev, run_as_root=True,
                   use_standard_locale=True)
@@ -546,9 +561,11 @@ def _get_configdrive(configdrive, node_uuid, tempdir=None):
 
     try:
         data = io.BytesIO(base64.decode_as_bytes(data))
-    except TypeError:
-        error_msg = (_('Config drive for node %s is not base64 encoded '
-                       'or the content is malformed.') % node_uuid)
+    except Exception as exc:
+        error_msg = (_('Config drive for node %(node)s is not base64 encoded '
+                       'or the content is malformed. %(cls)s: %(err)s.')
+                     % {'node': node_uuid, 'err': exc,
+                        'cls': type(exc).__name__})
         if is_url:
             error_msg += _(' Downloaded from "%s".') % configdrive
         raise exception.InstanceDeployFailure(error_msg)

@@ -22,7 +22,6 @@ from unittest import mock
 
 from oslo_concurrency import processutils
 from oslo_config import cfg
-from oslo_serialization import base64
 from oslo_utils import imageutils
 import requests
 
@@ -800,6 +799,58 @@ class DestroyMetaDataTestCase(base.IronicLibTestCase):
         disk_utils.destroy_disk_metadata(self.dev, self.node_uuid)
         mock_exec.assert_has_calls(expected_call)
 
+    def test_destroy_disk_metadata_ebr(self, mock_exec):
+        expected_calls = [mock.call('wipefs', '--force', '--all', 'fake-dev',
+                                    run_as_root=True,
+                                    use_standard_locale=True),
+                          mock.call('blockdev', '--getsz', 'fake-dev',
+                                    check_exit_code=[0],
+                                    run_as_root=True),
+                          mock.call('dd', 'bs=512', 'if=/dev/zero',
+                                    'of=fake-dev', 'count=2',
+                                    run_as_root=True,
+                                    use_standard_locale=True),
+                          mock.call('sgdisk', '-Z', 'fake-dev',
+                                    run_as_root=True,
+                                    use_standard_locale=True)]
+        mock_exec.side_effect = iter([
+            (None, None),
+            ('2\n', None),  # an EBR is 2 sectors
+            (None, None),
+            (None, None),
+            (None, None),
+            (None, None)])
+        disk_utils.destroy_disk_metadata(self.dev, self.node_uuid)
+        mock_exec.assert_has_calls(expected_calls)
+
+    def test_destroy_disk_metadata_tiny_partition(self, mock_exec):
+        expected_calls = [mock.call('wipefs', '--force', '--all', 'fake-dev',
+                                    run_as_root=True,
+                                    use_standard_locale=True),
+                          mock.call('blockdev', '--getsz', 'fake-dev',
+                                    check_exit_code=[0],
+                                    run_as_root=True),
+                          mock.call('dd', 'bs=512', 'if=/dev/zero',
+                                    'of=fake-dev', 'count=33',
+                                    run_as_root=True,
+                                    use_standard_locale=True),
+                          mock.call('dd', 'bs=512', 'if=/dev/zero',
+                                    'of=fake-dev', 'count=33', 'seek=9',
+                                    run_as_root=True,
+                                    use_standard_locale=True),
+                          mock.call('sgdisk', '-Z', 'fake-dev',
+                                    run_as_root=True,
+                                    use_standard_locale=True)]
+        mock_exec.side_effect = iter([
+            (None, None),
+            ('42\n', None),
+            (None, None),
+            (None, None),
+            (None, None),
+            (None, None)])
+        disk_utils.destroy_disk_metadata(self.dev, self.node_uuid)
+        mock_exec.assert_has_calls(expected_calls)
+
 
 @mock.patch.object(utils, 'execute', autospec=True)
 class GetDeviceBlockSizeTestCase(base.IronicLibTestCase):
@@ -961,14 +1012,10 @@ class GetConfigdriveTestCase(base.IronicLibTestCase):
                           'http://1.2.3.4/cd', 'fake-node-uuid')
         self.assertFalse(mock_copy.called)
 
-    @mock.patch.object(base64, 'decode_as_bytes', autospec=True)
-    def test_get_configdrive_base64_error(self, mock_b64, mock_requests,
-                                          mock_copy):
-        mock_b64.side_effect = TypeError
+    def test_get_configdrive_base64_error(self, mock_requests, mock_copy):
         self.assertRaises(exception.InstanceDeployFailure,
                           disk_utils._get_configdrive,
                           'malformed', 'fake-node-uuid')
-        mock_b64.assert_called_once_with('malformed')
         self.assertFalse(mock_copy.called)
 
     @mock.patch.object(gzip, 'GzipFile', autospec=True)
@@ -1048,6 +1095,29 @@ class OtherFunctionTestCase(base.IronicLibTestCase):
     @mock.patch.object(utils, 'execute', autospec=True)
     def test_convert_image_retries(self, execute_mock):
         ret_err = 'qemu: qemu_thread_create: Resource temporarily unavailable'
+        execute_mock.side_effect = [
+            processutils.ProcessExecutionError(stderr=ret_err), ('', ''),
+            processutils.ProcessExecutionError(stderr=ret_err), ('', ''),
+            ('', ''),
+        ]
+
+        disk_utils.convert_image('source', 'dest', 'out_format')
+        convert_call = mock.call('qemu-img', 'convert', '-O',
+                                 'out_format', 'source', 'dest',
+                                 run_as_root=False,
+                                 prlimit=mock.ANY,
+                                 use_standard_locale=True)
+        execute_mock.assert_has_calls([
+            convert_call,
+            mock.call('sync'),
+            convert_call,
+            mock.call('sync'),
+            convert_call,
+        ])
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_convert_image_retries_alternate_error(self, execute_mock):
+        ret_err = 'Failed to allocate memory: Cannot allocate memory\n'
         execute_mock.side_effect = [
             processutils.ProcessExecutionError(stderr=ret_err), ('', ''),
             processutils.ProcessExecutionError(stderr=ret_err), ('', ''),
