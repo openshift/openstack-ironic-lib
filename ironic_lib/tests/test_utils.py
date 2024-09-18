@@ -72,34 +72,6 @@ class ExecuteTestCase(base.IronicLibTestCase):
         execute_mock.assert_called_once_with('foo',
                                              env_variables={'foo': 'bar'})
 
-    def test_execute_without_root_helper(self):
-        CONF.set_override('root_helper', None, group='ironic_lib')
-        with mock.patch.object(
-                processutils, 'execute', autospec=True) as execute_mock:
-            utils.execute('foo', run_as_root=False)
-            execute_mock.assert_called_once_with('foo', run_as_root=False)
-
-    def test_execute_without_root_helper_run_as_root(self):
-        CONF.set_override('root_helper', None, group='ironic_lib')
-        with mock.patch.object(
-                processutils, 'execute', autospec=True) as execute_mock:
-            utils.execute('foo', run_as_root=True)
-            execute_mock.assert_called_once_with('foo', run_as_root=False)
-
-    def test_execute_with_root_helper(self):
-        with mock.patch.object(
-                processutils, 'execute', autospec=True) as execute_mock:
-            utils.execute('foo', run_as_root=False)
-            execute_mock.assert_called_once_with('foo', run_as_root=False)
-
-    def test_execute_with_root_helper_run_as_root(self):
-        with mock.patch.object(
-                processutils, 'execute', autospec=True) as execute_mock:
-            utils.execute('foo', run_as_root=True)
-            execute_mock.assert_called_once_with(
-                'foo', run_as_root=True,
-                root_helper=CONF.ironic_lib.root_helper)
-
     @mock.patch.object(utils, 'LOG', autospec=True)
     def _test_execute_with_log_stdout(self, log_mock, log_stdout=None):
         with mock.patch.object(
@@ -147,13 +119,10 @@ class MkfsTestCase(base.IronicLibTestCase):
         utils.mkfs('swap', '/my/swap/block/dev')
 
         expected = [mock.call('mkfs', '-t', 'ext4', '-F', '/my/block/dev',
-                              run_as_root=True,
                               use_standard_locale=True),
                     mock.call('mkfs', '-t', 'msdos', '/my/msdos/block/dev',
-                              run_as_root=True,
                               use_standard_locale=True),
                     mock.call('mkswap', '/my/swap/block/dev',
-                              run_as_root=True,
                               use_standard_locale=True)]
         self.assertEqual(expected, execute_mock.call_args_list)
 
@@ -164,13 +133,13 @@ class MkfsTestCase(base.IronicLibTestCase):
         utils.mkfs('swap', '/my/swap/block/dev', 'swap-vol')
 
         expected = [mock.call('mkfs', '-t', 'ext4', '-F', '-L', 'ext4-vol',
-                              '/my/block/dev', run_as_root=True,
+                              '/my/block/dev',
                               use_standard_locale=True),
                     mock.call('mkfs', '-t', 'msdos', '-n', 'msdos-vol',
-                              '/my/msdos/block/dev', run_as_root=True,
+                              '/my/msdos/block/dev',
                               use_standard_locale=True),
                     mock.call('mkswap', '-L', 'swap-vol',
-                              '/my/swap/block/dev', run_as_root=True,
+                              '/my/swap/block/dev',
                               use_standard_locale=True)]
         self.assertEqual(expected, execute_mock.call_args_list)
 
@@ -501,148 +470,6 @@ class MatchRootDeviceTestCase(base.IronicLibTestCase):
         self.assertEqual([self.devices[0]], devs)
 
 
-class WaitForDisk(base.IronicLibTestCase):
-
-    def setUp(self):
-        super(WaitForDisk, self).setUp()
-        CONF.set_override('check_device_interval', .01,
-                          group='disk_partitioner')
-        CONF.set_override('check_device_max_retries', 2,
-                          group='disk_partitioner')
-
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_wait_for_disk_to_become_available(self, mock_exc):
-        mock_exc.return_value = ('', '')
-        utils.wait_for_disk_to_become_available('fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(1, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call])
-
-    @mock.patch.object(utils, 'execute', autospec=True,
-                       side_effect=processutils.ProcessExecutionError(
-                           stderr='fake'))
-    def test_wait_for_disk_to_become_available_no_fuser(self, mock_exc):
-        self.assertRaises(exception.IronicException,
-                          utils.wait_for_disk_to_become_available,
-                          'fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(2, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call, fuser_call])
-
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_wait_for_disk_to_become_available_device_in_use_psmisc(
-            self, mock_exc):
-        # Test that the device is not available. This version has the 'psmisc'
-        # version of 'fuser' values for stdout and stderr.
-        # NOTE(TheJulia): Looks like fuser returns the actual list of pids
-        # in the stdout output, where as all other text is returned in
-        # stderr.
-        # The 'psmisc' version has a leading space character in stdout. The
-        # filename is output to stderr
-        mock_exc.side_effect = [(' 1234   ', 'fake-dev: '),
-                                (' 15503  3919 15510 15511', 'fake-dev:')]
-        expected_error = ('Processes with the following PIDs are '
-                          'holding device fake-dev: 15503, 3919, 15510, '
-                          '15511. Timed out waiting for completion.')
-        self.assertRaisesRegex(
-            exception.IronicException,
-            expected_error,
-            utils.wait_for_disk_to_become_available,
-            'fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(2, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call, fuser_call])
-
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_wait_for_disk_to_become_available_device_in_use_busybox(
-            self, mock_exc):
-        # Test that the device is not available. This version has the 'busybox'
-        # version of 'fuser' values for stdout and stderr.
-        # NOTE(TheJulia): Looks like fuser returns the actual list of pids
-        # in the stdout output, where as all other text is returned in
-        # stderr.
-        # The 'busybox' version does not have a leading space character in
-        # stdout. Also nothing is output to stderr.
-        mock_exc.side_effect = [('1234', ''),
-                                ('15503  3919 15510 15511', '')]
-        expected_error = ('Processes with the following PIDs are '
-                          'holding device fake-dev: 15503, 3919, 15510, '
-                          '15511. Timed out waiting for completion.')
-        self.assertRaisesRegex(
-            exception.IronicException,
-            expected_error,
-            utils.wait_for_disk_to_become_available,
-            'fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(2, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call, fuser_call])
-
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_wait_for_disk_to_become_available_no_device(self, mock_exc):
-        # NOTE(TheJulia): Looks like fuser returns the actual list of pids
-        # in the stdout output, where as all other text is returned in
-        # stderr.
-
-        mock_exc.return_value = ('', 'Specified filename /dev/fake '
-                                     'does not exist.')
-        expected_error = ('Fuser exited with "Specified filename '
-                          '/dev/fake does not exist." while checking '
-                          'locks for device fake-dev. Timed out waiting '
-                          'for completion.')
-        self.assertRaisesRegex(
-            exception.IronicException,
-            expected_error,
-            utils.wait_for_disk_to_become_available,
-            'fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(2, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call, fuser_call])
-
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_wait_for_disk_to_become_available_dev_becomes_avail_psmisc(
-            self, mock_exc):
-        # Test that initially device is not available but then becomes
-        # available. This version has the 'psmisc' version of 'fuser' values
-        # for stdout and stderr.
-        # The 'psmisc' version has a leading space character in stdout. The
-        # filename is output to stderr
-        mock_exc.side_effect = [(' 1234   ', 'fake-dev: '),
-                                ('', '')]
-        utils.wait_for_disk_to_become_available('fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(2, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call, fuser_call])
-
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_wait_for_disk_to_become_available_dev_becomes_avail_busybox(
-            self, mock_exc):
-        # Test that initially device is not available but then becomes
-        # available. This version has the 'busybox' version of 'fuser' values
-        # for stdout and stderr.
-        # The 'busybox' version does not have a leading space character in
-        # stdout. Also nothing is output to stderr.
-        mock_exc.side_effect = [('1234 5895', ''),
-                                ('', '')]
-        utils.wait_for_disk_to_become_available('fake-dev')
-        fuser_cmd = ['fuser', 'fake-dev']
-        fuser_call = mock.call(*fuser_cmd, run_as_root=True,
-                               check_exit_code=[0, 1])
-        self.assertEqual(2, mock_exc.call_count)
-        mock_exc.assert_has_calls([fuser_call, fuser_call])
-
-
 @mock.patch.object(utils, 'execute', autospec=True)
 class GetRouteSourceTestCase(base.IronicLibTestCase):
 
@@ -690,8 +517,8 @@ class MountedTestCase(base.IronicLibTestCase):
             self.assertIs(path, mock_temp.return_value)
         mock_execute.assert_has_calls([
             mock.call("mount", '/dev/fake', mock_temp.return_value,
-                      run_as_root=True, attempts=1, delay_on_retry=True),
-            mock.call("umount", mock_temp.return_value, run_as_root=True,
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", mock_temp.return_value,
                       attempts=3, delay_on_retry=True),
         ])
         mock_rmtree.assert_called_once_with(mock_temp.return_value)
@@ -700,9 +527,9 @@ class MountedTestCase(base.IronicLibTestCase):
         with utils.mounted('/dev/fake', '/mnt/fake') as path:
             self.assertEqual('/mnt/fake', path)
         mock_execute.assert_has_calls([
-            mock.call("mount", '/dev/fake', '/mnt/fake', run_as_root=True,
+            mock.call("mount", '/dev/fake', '/mnt/fake',
                       attempts=1, delay_on_retry=True),
-            mock.call("umount", '/mnt/fake', run_as_root=True,
+            mock.call("umount", '/mnt/fake',
                       attempts=3, delay_on_retry=True),
         ])
         self.assertFalse(mock_temp.called)
@@ -714,8 +541,8 @@ class MountedTestCase(base.IronicLibTestCase):
             self.assertEqual('/mnt/fake', path)
         mock_execute.assert_has_calls([
             mock.call("mount", '/dev/fake', '/mnt/fake', '-o', 'ro,foo=bar',
-                      run_as_root=True, attempts=1, delay_on_retry=True),
-            mock.call("umount", '/mnt/fake', run_as_root=True,
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", '/mnt/fake',
                       attempts=3, delay_on_retry=True),
         ])
 
@@ -725,8 +552,8 @@ class MountedTestCase(base.IronicLibTestCase):
             self.assertEqual('/mnt/fake', path)
         mock_execute.assert_has_calls([
             mock.call("mount", '/dev/fake', '/mnt/fake', '-t', 'iso9660',
-                      run_as_root=True, attempts=1, delay_on_retry=True),
-            mock.call("umount", '/mnt/fake', run_as_root=True,
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", '/mnt/fake',
                       attempts=3, delay_on_retry=True),
         ])
 
@@ -735,7 +562,6 @@ class MountedTestCase(base.IronicLibTestCase):
         self.assertRaises(OSError, utils.mounted('/dev/fake').__enter__)
         mock_execute.assert_called_once_with("mount", '/dev/fake',
                                              mock_temp.return_value,
-                                             run_as_root=True,
                                              attempts=1,
                                              delay_on_retry=True)
         mock_rmtree.assert_called_once_with(mock_temp.return_value)
@@ -746,9 +572,9 @@ class MountedTestCase(base.IronicLibTestCase):
         with utils.mounted('/dev/fake', '/mnt/fake') as path:
             self.assertEqual('/mnt/fake', path)
         mock_execute.assert_has_calls([
-            mock.call("mount", '/dev/fake', '/mnt/fake', run_as_root=True,
+            mock.call("mount", '/dev/fake', '/mnt/fake',
                       attempts=1, delay_on_retry=True),
-            mock.call("umount", '/mnt/fake', run_as_root=True,
+            mock.call("umount", '/mnt/fake',
                       attempts=3, delay_on_retry=True),
         ])
         self.assertFalse(mock_rmtree.called)
