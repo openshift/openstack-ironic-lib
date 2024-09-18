@@ -29,27 +29,17 @@ import shlex
 import shutil
 import tempfile
 from urllib import parse as urlparse
+import warnings
 
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_utils import excutils
 from oslo_utils import specs_matcher
 from oslo_utils import strutils
 from oslo_utils import units
-import tenacity
 
 from ironic_lib.common.i18n import _
 from ironic_lib import exception
 
-utils_opts = [
-    cfg.StrOpt('root_helper',
-               default='sudo ironic-rootwrap /etc/ironic/rootwrap.conf',
-               help='Command that is prefixed to commands that are run as '
-                    'root. If not specified, no commands are run as root.'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(utils_opts, group='ironic_lib')
 
 LOG = logging.getLogger(__name__)
 
@@ -86,13 +76,9 @@ def execute(*cmd, use_standard_locale=False, log_stdout=True, **kwargs):
         env['LC_ALL'] = 'C'
         kwargs['env_variables'] = env
 
-    # If root_helper config is not specified, no commands are run as root.
-    run_as_root = kwargs.get('run_as_root', False)
-    if run_as_root:
-        if not CONF.ironic_lib.root_helper:
-            kwargs['run_as_root'] = False
-        else:
-            kwargs['root_helper'] = CONF.ironic_lib.root_helper
+    if kwargs.pop('run_as_root', False):
+        warnings.warn("run_as_root is deprecated and has no effect",
+                      DeprecationWarning)
 
     def _log(stdout, stderr):
         if log_stdout:
@@ -167,7 +153,7 @@ def mkfs(fs, path, label=None):
         args.extend([label_opt, label])
     args.append(path)
     try:
-        execute(*args, run_as_root=True, use_standard_locale=True)
+        execute(*args, use_standard_locale=True)
     except processutils.ProcessExecutionError as e:
         with excutils.save_and_reraise_exception() as ctx:
             if os.strerror(errno.ENOENT) in e.stderr:
@@ -204,7 +190,7 @@ def dd(src, dst, *args):
     """
     LOG.debug("Starting dd process.")
     execute('dd', 'if=%s' % src, 'of=%s' % dst, *args,
-            use_standard_locale=True, run_as_root=True)
+            use_standard_locale=True)
 
 
 def is_http_url(url):
@@ -214,7 +200,7 @@ def is_http_url(url):
 
 def list_opts():
     """Entry point for oslo-config-generator."""
-    return [('ironic_lib', utils_opts)]
+    return [('ironic_lib', [])]  # placeholder
 
 
 def _extract_hint_operator_and_values(hint_expression, hint_name):
@@ -501,89 +487,6 @@ def match_root_device_hints(devices, root_device_hints):
         return dev
 
 
-def wait_for_disk_to_become_available(device):
-    """Wait for a disk device to become available.
-
-    Waits for a disk device to become available for use by
-    waiting until all process locks on the device have been
-    released.
-
-    Timeout and iteration settings come from the configuration
-    options used by the in-library disk_partitioner:
-    ``check_device_interval`` and ``check_device_max_retries``.
-
-    :params device: The path to the device.
-    :raises: IronicException If the disk fails to become
-        available.
-    """
-    pids = ['']
-    stderr = ['']
-    interval = CONF.disk_partitioner.check_device_interval
-    max_retries = CONF.disk_partitioner.check_device_max_retries
-
-    def _wait_for_disk():
-        # A regex is likely overkill here, but variations in fuser
-        # means we should likely use it.
-        fuser_pids_re = re.compile(r'\d+')
-
-        # There are 'psmisc' and 'busybox' versions of the 'fuser' program. The
-        # 'fuser' programs differ in how they output data to stderr.  The
-        # busybox version does not output the filename to stderr, while the
-        # standard 'psmisc' version does output the filename to stderr.  How
-        # they output to stdout is almost identical in that only the PIDs are
-        # output to stdout, with the 'psmisc' version adding a leading space
-        # character to the list of PIDs.
-        try:
-            # NOTE(ifarkas): fuser returns a non-zero return code if none of
-            #                the specified files is accessed.
-            # NOTE(TheJulia): fuser does not report LVM devices as in use
-            #                 unless the LVM device-mapper device is the
-            #                 device that is directly polled.
-            # NOTE(TheJulia): The -m flag allows fuser to reveal data about
-            #                 mounted filesystems, which should be considered
-            #                 busy/locked. That being said, it is not used
-            #                 because busybox fuser has a different behavior.
-            # NOTE(TheJuia): fuser outputs a list of found PIDs to stdout.
-            #                All other text is returned via stderr, and the
-            #                output to a terminal is merged as a result.
-            out, err = execute('fuser', device, check_exit_code=[0, 1],
-                               run_as_root=True)
-
-            if not out and not err:
-                return True
-
-            stderr[0] = err
-            # NOTE: findall() returns a list of matches, or an empty list if no
-            # matches
-            pids[0] = fuser_pids_re.findall(out)
-
-        except processutils.ProcessExecutionError as exc:
-            LOG.warning('Failed to check the device %(device)s with fuser:'
-                        ' %(err)s', {'device': device, 'err': exc})
-        return False
-
-    retry = tenacity.retry(
-        retry=tenacity.retry_if_result(lambda r: not r),
-        stop=tenacity.stop_after_attempt(max_retries),
-        wait=tenacity.wait_fixed(interval),
-        reraise=True)
-    try:
-        retry(_wait_for_disk)()
-    except tenacity.RetryError:
-        if pids[0]:
-            raise exception.IronicException(
-                _('Processes with the following PIDs are holding '
-                  'device %(device)s: %(pids)s. '
-                  'Timed out waiting for completion.')
-                % {'device': device, 'pids': ', '.join(pids[0])})
-        else:
-            raise exception.IronicException(
-                _('Fuser exited with "%(fuser_err)s" while checking '
-                  'locks for device %(device)s. Timed out waiting for '
-                  'completion.')
-                % {'device': device, 'fuser_err': stderr[0]})
-
-
 def get_route_source(dest, ignore_link_local=True):
     """Get the IP address to send packages to destination."""
     try:
@@ -635,15 +538,15 @@ def mounted(source, dest=None, opts=None, fs_type=None,
 
     mounted = False
     try:
-        execute("mount", source, dest, *params, run_as_root=True,
-                attempts=mount_attempts, delay_on_retry=True)
+        execute("mount", source, dest, *params, attempts=mount_attempts,
+                delay_on_retry=True)
         mounted = True
         yield dest
     finally:
         if mounted:
             try:
-                execute("umount", dest, run_as_root=True,
-                        attempts=umount_attempts, delay_on_retry=True)
+                execute("umount", dest, attempts=umount_attempts,
+                        delay_on_retry=True)
             except (EnvironmentError,
                     processutils.ProcessExecutionError) as exc:
                 LOG.warning(
